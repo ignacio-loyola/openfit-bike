@@ -62,35 +62,46 @@ float calculatePower(float cadence, int resistancePercent) {
     return baseResistance * angularVelocity;
 }
 
+
 void updateMetrics() {
     static unsigned long lastMagnetTime = 0;
     static unsigned long currentMagnetTime = 0;
+    static unsigned long lastValidMagnetTime = 0;
+    static const unsigned long DEBOUNCE_TIME = 20;  // 20ms debounce
     
     unsigned long currentTime = millis();
     
     if (digitalRead(MAGNET_SENSOR_PIN) == LOW) {  // Magnet detected
-        currentMagnetTime = currentTime;
-        if (lastMagnetTime != 0) {
-            unsigned long timeDiff = currentMagnetTime - lastMagnetTime;
-            if (timeDiff > 0) {
-                cadence = min(60000.0 / timeDiff, 200.0); // Cap at 200 RPM
+        if (currentTime - lastMagnetTime > DEBOUNCE_TIME) {  // Basic debounce
+            currentMagnetTime = currentTime;
+            
+            if (lastMagnetTime != 0) {
+                unsigned long timeDiff = currentMagnetTime - lastMagnetTime;
+                
+                // Map timeDiff to beginner cadence range (40-90 RPM)
+                if (timeDiff > 222 && timeDiff < 1500) {  // Between 90 and 40 RPM range  
+                    cadence = map(timeDiff, 222, 1500, 90, 40);
+                    lastValidMagnetTime = currentTime;
+                }
             }
+            lastMagnetTime = currentMagnetTime;
         }
-        lastMagnetTime = currentMagnetTime;
-        delay(50);  // Debounce
     }
 
-    // Reset cadence if no updates for 3 seconds
-    if (currentTime - lastMagnetTime > 3000) {
+    // Reset cadence if no valid updates for 2 seconds
+    if (currentTime - lastValidMagnetTime > 2000) {
         cadence = 0;
     }
+    
+    // Cap cadence at 90 RPM for beginner range
+    cadence = min(cadence, 90.0f);
 
     // Get resistance and calculate power
     resistance = getSmoothedResistance();
     power = calculatePower(cadence, resistance);
 
-    // Calculate speed based on cadence (for static bike)
-    speed = (cadence * 0.4);  // Simple conversion factor
+    // Calculate speed based on cadence (adjusted for beginner range)
+    speed = (cadence * 0.25);  // Adjusted conversion factor
 }
 
 void sendBLEData() {
