@@ -9,19 +9,21 @@
 #define INDOOR_BIKE_DATA_CHARACTERISTIC    "2AD2"
 #define RESISTANCE_LEVEL_CHARACTERISTIC    "2AD6"
 
+// Pin definitions
+const int MAGNET_SENSOR_PIN = 12;
+const int RESISTANCE_PIN = 34;
+const int READINGS_COUNT = 10;
+
+// Calibrated resistance values from testing
+const int RESISTANCE_MIN = 1863;  // No contact value
+const int RESISTANCE_MAX = 2267;  // Full contact value
+
 // Simulated values matching Auuki app ranges
 float power = 124.0;        // Starting power like shown in image
 float cadence = 85.0;       // Starting cadence
 float speed = 30.6;         // Speed shown in image
-int powerLap = 160;         // Power lap value from image
 int resistance = 50;        // Middle resistance value
 bool deviceConnected = false;
-
-// Simulation control
-unsigned long lastUpdate = 0;
-bool isHighIntensity = false;
-unsigned long intervalStart = 0;
-const unsigned long INTERVAL_DURATION = 60000; // 1-minute intervals
 
 BLEServer* pServer = NULL;
 BLECharacteristic* pIndoorBikeDataCharacteristic = NULL;
@@ -40,61 +42,67 @@ class MyServerCallbacks: public BLEServerCallbacks {
     }
 };
 
-void updateSimulatedMetrics() {
+int getSmoothedResistance() {
+    long sum = 0;
+    for(int i = 0; i < READINGS_COUNT; i++) {
+        sum += analogRead(RESISTANCE_PIN);
+        delay(1);
+    }
+    int rawResistance = sum / READINGS_COUNT;
+    
+    // Map using calibrated values, resistance increases as value increases
+    int percentage = map(rawResistance, RESISTANCE_MIN, RESISTANCE_MAX, 0, 100);
+    return constrain(percentage, 0, 100);
+}
+
+float calculatePower(float cadence, int resistancePercent) {
+    // Adjust power calculation based on calibrated resistance
+    float baseResistance = map(resistancePercent, 0, 100, 5, 40);  // 5-40 Nm torque range
+    float angularVelocity = cadence * 0.104720;  // Convert RPM to rad/s
+    return baseResistance * angularVelocity;
+}
+
+void updateMetrics() {
+    static unsigned long lastMagnetTime = 0;
+    static unsigned long currentMagnetTime = 0;
+    
     unsigned long currentTime = millis();
     
-    // Update interval state every INTERVAL_DURATION
-    if (currentTime - intervalStart >= INTERVAL_DURATION) {
-        intervalStart = currentTime;
-        isHighIntensity = !isHighIntensity;
+    if (digitalRead(MAGNET_SENSOR_PIN) == LOW) {  // Magnet detected
+        currentMagnetTime = currentTime;
+        if (lastMagnetTime != 0) {
+            unsigned long timeDiff = currentMagnetTime - lastMagnetTime;
+            if (timeDiff > 0) {
+                cadence = min(60000.0 / timeDiff, 200.0); // Cap at 200 RPM
+            }
+        }
+        lastMagnetTime = currentMagnetTime;
+        delay(50);  // Debounce
     }
 
-    // Simulate interval training pattern
-    if (isHighIntensity) {
-        // High intensity phase
-        power = 160.0 + random(-10, 11);
-        cadence = 85.0 + random(-5, 6);
-        speed = 35.0 + random(-2, 3);
-        resistance = 70 + random(-5, 6);
-    } else {
-        // Recovery phase
-        power = 124.0 + random(-10, 11);
-        cadence = 60.0 + random(-5, 6);
-        speed = 30.6 + random(-2, 3);
-        resistance = 50 + random(-5, 6);
+    // Reset cadence if no updates for 3 seconds
+    if (currentTime - lastMagnetTime > 3000) {
+        cadence = 0;
     }
 
-    // Ensure values stay in realistic ranges
-    power = constrain(power, 50, 300);
-    cadence = constrain(cadence, 0, 120);
-    speed = constrain(speed, 15, 45);
-    resistance = constrain(resistance, 0, 100);
+    // Get resistance and calculate power
+    resistance = getSmoothedResistance();
+    power = calculatePower(cadence, resistance);
+
+    // Calculate speed based on cadence (for static bike)
+    speed = (cadence * 0.4);  // Simple conversion factor
 }
 
 void sendBLEData() {
     if (deviceConnected) {
-        // Create Indoor Bike Data packet according to FTMS specification
-        uint8_t bikeData[12]; // Increased size to accommodate more fields
+        uint8_t bikeData[8];
         
-        // Flags (first 2 bytes) - Indicate which fields are present
-        // Bit 0: More Data
-        // Bit 1: Average Speed Present
-        // Bit 2: Instantaneous Cadence Present
-        // Bit 3: Average Cadence Present
-        // Bit 4: Total Distance Present
-        // Bit 5: Resistance Level Present
-        // Bit 6: Instantaneous Power Present
-        // Bit 7: Average Power Present
-        // Bit 8: Expended Energy Present
-        // Bit 9: Heart Rate Present
-        // Bit 10: Metabolic Equivalent Present
-        // Bit 11: Elapsed Time Present
-        // Bit 12: Remaining Time Present
-        uint16_t flags = 0x44; // Instantaneous Speed (bit 2) and Power (bit 6) present
+        // Flags (first 2 bytes)
+        uint16_t flags = 0x44;  // Speed and Power present
         bikeData[0] = flags & 0xFF;
         bikeData[1] = (flags >> 8) & 0xFF;
         
-        // Instantaneous Speed (km/h with resolution of 0.01)
+        // Speed (km/h with resolution of 0.01)
         uint16_t speedValue = speed * 100;
         bikeData[2] = speedValue & 0xFF;
         bikeData[3] = (speedValue >> 8) & 0xFF;
@@ -104,7 +112,7 @@ void sendBLEData() {
         bikeData[4] = cadenceValue & 0xFF;
         bikeData[5] = (cadenceValue >> 8) & 0xFF;
         
-        // Instantaneous Power (watts with resolution of 1)
+        // Instantaneous Power
         uint16_t powerValue = (uint16_t)power;
         bikeData[6] = powerValue & 0xFF;
         bikeData[7] = (powerValue >> 8) & 0xFF;
@@ -116,8 +124,8 @@ void sendBLEData() {
 
 void setup() {
     Serial.begin(115200);
-    randomSeed(analogRead(0));
-    intervalStart = millis();
+    pinMode(MAGNET_SENSOR_PIN, INPUT_PULLUP);
+    pinMode(RESISTANCE_PIN, INPUT);
 
     // Create the BLE Device
     BLEDevice::init(DEVICE_NAME);
@@ -143,11 +151,11 @@ void setup() {
     pAdvertising->setMinPreferred(0x06);
     BLEDevice::startAdvertising();
 
-    Serial.println("BLE Indoor Bike Test Mode Ready!");
+    Serial.println("BLE Indoor Bike Ready!");
 }
 
 void loop() {
-    updateSimulatedMetrics();
+    updateMetrics();
     
     if (deviceConnected) {
         sendBLEData();
