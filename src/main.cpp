@@ -9,15 +9,19 @@
 #define INDOOR_BIKE_DATA_CHARACTERISTIC    "2AD2"
 #define RESISTANCE_LEVEL_CHARACTERISTIC    "2AD6"
 
-// Simulated values
-float rpm = 80.0;          // Starting at 80 RPM
-int resistance = 50;       // 50% resistance
-float power = 150.0;       // 150W starting power
+// Simulated values matching Auuki app ranges
+float power = 124.0;        // Starting power like shown in image
+float cadence = 85.0;       // Starting cadence
+float speed = 30.6;         // Speed shown in image
+int powerLap = 160;         // Power lap value from image
+int resistance = 50;        // Middle resistance value
 bool deviceConnected = false;
 
-// Direction of value change for simulation
-bool rpmIncreasing = true;
-bool powerIncreasing = true;
+// Simulation control
+unsigned long lastUpdate = 0;
+bool isHighIntensity = false;
+unsigned long intervalStart = 0;
+const unsigned long INTERVAL_DURATION = 60000; // 1-minute intervals
 
 BLEServer* pServer = NULL;
 BLECharacteristic* pIndoorBikeDataCharacteristic = NULL;
@@ -37,44 +41,70 @@ class MyServerCallbacks: public BLEServerCallbacks {
 };
 
 void updateSimulatedMetrics() {
-    // Simulate realistic RPM changes (60-100 RPM range)
-    if (rpmIncreasing) {
-        rpm += random(1, 3) * 0.5;
-        if (rpm >= 100) rpmIncreasing = false;
+    unsigned long currentTime = millis();
+    
+    // Update interval state every INTERVAL_DURATION
+    if (currentTime - intervalStart >= INTERVAL_DURATION) {
+        intervalStart = currentTime;
+        isHighIntensity = !isHighIntensity;
+    }
+
+    // Simulate interval training pattern
+    if (isHighIntensity) {
+        // High intensity phase
+        power = 160.0 + random(-10, 11);
+        cadence = 85.0 + random(-5, 6);
+        speed = 35.0 + random(-2, 3);
+        resistance = 70 + random(-5, 6);
     } else {
-        rpm -= random(1, 3) * 0.5;
-        if (rpm <= 60) rpmIncreasing = true;
+        // Recovery phase
+        power = 124.0 + random(-10, 11);
+        cadence = 60.0 + random(-5, 6);
+        speed = 30.6 + random(-2, 3);
+        resistance = 50 + random(-5, 6);
     }
 
-    // Simulate resistance changes (30-70% range)
-    if (random(100) < 10) { // 10% chance to change resistance
-        resistance = constrain(resistance + random(-5, 6), 30, 70);
-    }
-
-    // Simulate power based on RPM and resistance (100-300W range)
-    power = (rpm * resistance * 0.15) + random(-10, 11);
-    power = constrain(power, 100, 300);
+    // Ensure values stay in realistic ranges
+    power = constrain(power, 50, 300);
+    cadence = constrain(cadence, 0, 120);
+    speed = constrain(speed, 15, 45);
+    resistance = constrain(resistance, 0, 100);
 }
 
 void sendBLEData() {
     if (deviceConnected) {
-        uint8_t bikeData[8];
+        // Create Indoor Bike Data packet according to FTMS specification
+        uint8_t bikeData[12]; // Increased size to accommodate more fields
         
-        // Flags (first 2 bytes)
-        uint16_t flags = 0x0045;  // Speed, Cadence, Power
+        // Flags (first 2 bytes) - Indicate which fields are present
+        // Bit 0: More Data
+        // Bit 1: Average Speed Present
+        // Bit 2: Instantaneous Cadence Present
+        // Bit 3: Average Cadence Present
+        // Bit 4: Total Distance Present
+        // Bit 5: Resistance Level Present
+        // Bit 6: Instantaneous Power Present
+        // Bit 7: Average Power Present
+        // Bit 8: Expended Energy Present
+        // Bit 9: Heart Rate Present
+        // Bit 10: Metabolic Equivalent Present
+        // Bit 11: Elapsed Time Present
+        // Bit 12: Remaining Time Present
+        uint16_t flags = 0x44; // Instantaneous Speed (bit 2) and Power (bit 6) present
         bikeData[0] = flags & 0xFF;
         bikeData[1] = (flags >> 8) & 0xFF;
         
-        // Speed (static bike)
-        bikeData[2] = 0;
-        bikeData[3] = 0;
+        // Instantaneous Speed (km/h with resolution of 0.01)
+        uint16_t speedValue = speed * 100;
+        bikeData[2] = speedValue & 0xFF;
+        bikeData[3] = (speedValue >> 8) & 0xFF;
         
-        // Instantaneous Cadence (resolution 0.5)
-        uint16_t cadence = rpm * 2;
-        bikeData[4] = cadence & 0xFF;
-        bikeData[5] = (cadence >> 8) & 0xFF;
+        // Instantaneous Cadence (rpm with resolution of 0.5)
+        uint16_t cadenceValue = cadence * 2;
+        bikeData[4] = cadenceValue & 0xFF;
+        bikeData[5] = (cadenceValue >> 8) & 0xFF;
         
-        // Instantaneous Power
+        // Instantaneous Power (watts with resolution of 1)
         uint16_t powerValue = (uint16_t)power;
         bikeData[6] = powerValue & 0xFF;
         bikeData[7] = (powerValue >> 8) & 0xFF;
@@ -86,12 +116,11 @@ void sendBLEData() {
 
 void setup() {
     Serial.begin(115200);
-    randomSeed(analogRead(0));  // Initialize random number generator
+    randomSeed(analogRead(0));
+    intervalStart = millis();
 
     // Create the BLE Device
     BLEDevice::init(DEVICE_NAME);
-
-    // Create the BLE Server
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
 
@@ -105,7 +134,6 @@ void setup() {
     );
     pIndoorBikeDataCharacteristic->addDescriptor(new BLE2902());
 
-    // Start the service
     pService->start();
 
     // Start advertising
@@ -125,8 +153,8 @@ void loop() {
         sendBLEData();
     }
     
-    Serial.printf("Power: %.1fW, Cadence: %.1frpm, Resistance: %d%%\n",
-                  power, rpm, resistance);
+    Serial.printf("Power: %.1fW, Cadence: %.1frpm, Speed: %.1fkm/h, Resistance: %d%%\n",
+                  power, cadence, speed, resistance);
     
     delay(100);  // 10Hz update rate
 }
