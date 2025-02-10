@@ -4,45 +4,27 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
+// Basic configuration
 #define DEVICE_NAME "LibrePulse Bike"
-#define FITNESSMACHINE_SERVICE_UUID        "1826"
-#define INDOOR_BIKE_DATA_CHARACTERISTIC    "2AD2"
-#define RESISTANCE_LEVEL_CHARACTERISTIC    "2AD6"
 
 // Pin definitions
 const int MAGNET_SENSOR_PIN = 12;
 const int RESISTANCE_PIN = 34;
-const int READINGS_COUNT = 10;
 
-// Calibrated resistance values from testing
-const int RESISTANCE_MIN = 1863;  // No contact value
-const int RESISTANCE_MAX = 2267;  // Full contact value
-
-// Variables for bike metrics
-float power = 0.0;
+// Bike metrics
 float cadence = 0.0;
-float lastValidCadence = 0.0;  // Store last valid cadence
 float speed = 0.0;
-int resistance = 50;
+float power = 0.0;
+int resistance = 0;
+
+// Connected status
 bool deviceConnected = false;
 
-// Timing constants for beginner-intermediate
-const unsigned long MAX_SPEED_HOLD_TIME = 1000;    // Time to trigger max speed when magnet held
-const unsigned long MIN_HALF_REV_TIME = 250;       // 120 RPM max
-const unsigned long MAX_HALF_REV_TIME = 1000;      // 30 RPM min
-const float MAX_CADENCE = 120.0;                   // Maximum cadence for beginner-intermediate (RPM)
-const float MIN_CADENCE = 30.0;                    // Minimum cadence (RPM)
-
-// Validation constants
-const unsigned long ZERO_TIMEOUT = 3000;           // Time before resetting to zero (increased from 2000)
-const unsigned long MIN_VALID_TIME = 100;          // Minimum time between valid readings
-const float CADENCE_CHANGE_THRESHOLD = 30.0;       // Maximum allowed sudden change in cadence
-
+// BLE objects
 BLEServer* pServer = NULL;
-BLECharacteristic* pIndoorBikeDataCharacteristic = NULL;
-BLECharacteristic* pResistanceCharacteristic = NULL;
+BLECharacteristic* pBikeDataCharacteristic = NULL;
 
-class MyServerCallbacks: public BLEServerCallbacks {
+class ServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
         deviceConnected = true;
         Serial.println("Client Connected");
@@ -55,190 +37,166 @@ class MyServerCallbacks: public BLEServerCallbacks {
     }
 };
 
-int getSmoothedResistance() {
-    long sum = 0;
-    for(int i = 0; i < READINGS_COUNT; i++) {
-        sum += analogRead(RESISTANCE_PIN);
-        delay(1);
-    }
-    int rawResistance = sum / READINGS_COUNT;
-    
-    int percentage = map(rawResistance, RESISTANCE_MIN, RESISTANCE_MAX, 0, 100);
-    return constrain(percentage, 0, 100);
-}
-
-float calculatePower(float cadence, int resistancePercent) {
-    float baseResistance = map(resistancePercent, 0, 100, 5, 40);
-    float angularVelocity = cadence * 0.104720;
-    return baseResistance * angularVelocity;
-}
-
-bool isValidCadenceChange(float newCadence, float oldCadence) {
-    // Check if the change in cadence is within reasonable limits
-    return abs(newCadence - oldCadence) <= CADENCE_CHANGE_THRESHOLD;
-}
-
-void updateMetrics() {
+void updateCadence() {
     static unsigned long lastTriggerTime = 0;
     static unsigned long lastValidTime = 0;
-    static unsigned long magnetStartTime = 0;
-    static bool wasTriggered = false;
-    static const unsigned long DEBOUNCE_TIME = 20;  // 20ms debounce
-    static float cadenceBuffer[5] = {0};  // Buffer for averaging
-    static int bufferIndex = 0;
+    static bool lastMagnetState = HIGH;
+    static const unsigned long TIMEOUT = 3000;  // Increased timeout to 3 seconds
+    static float lastValidCadence = 0;
+    static const unsigned long MIN_TRIGGER_TIME = 100;  // Minimum time between triggers (ms)
     
     unsigned long currentTime = millis();
-    bool isMagnetTriggered = (digitalRead(MAGNET_SENSOR_PIN) == LOW);
+    bool currentMagnetState = digitalRead(MAGNET_SENSOR_PIN);
     
-    // Track when magnet first triggered
-    if (isMagnetTriggered && !wasTriggered) {
-        magnetStartTime = currentTime;
-    }
-    
-    // Check for maximum speed condition (magnet held down)
-    if (isMagnetTriggered && (currentTime - magnetStartTime >= MAX_SPEED_HOLD_TIME)) {
-        cadence = MAX_CADENCE;
-        lastValidTime = currentTime;
-        lastValidCadence = cadence;
-        Serial.println("Maximum speed triggered!");
-    }
-    // Normal speed detection
-    else if (isMagnetTriggered) {
-        // Check if enough time has passed since last trigger (debounce)
-        if (currentTime - lastTriggerTime >= DEBOUNCE_TIME && 
-            currentTime - lastTriggerTime >= MIN_VALID_TIME) {
-            
-            if (lastTriggerTime != 0) {
-                unsigned long timeDiff = currentTime - lastTriggerTime;
+    // Detect magnet trigger (falling edge)
+    if (currentMagnetState == LOW && lastMagnetState == HIGH) {
+        unsigned long timeSinceLastTrigger = currentTime - lastTriggerTime;
+        
+        // Only process if enough time has passed (debounce)
+        if (timeSinceLastTrigger >= MIN_TRIGGER_TIME) {
+            if (lastTriggerTime > 0) {
+                // Calculate time for half revolution (since we have 2 magnets)
+                // Convert to RPM: (60 seconds * 1000ms) / (halfRevTime * 2 for full revolution)
+                float newCadence = (30000.0f) / timeSinceLastTrigger;
                 
-                // Calculate cadence based on half revolution (two magnets)
-                if (timeDiff >= MIN_HALF_REV_TIME && timeDiff <= MAX_HALF_REV_TIME) {
-                    float calculatedCadence = (60.0f * 1000.0f) / (timeDiff * 2.0f);
-                    
-                    // Validate the calculated cadence
-                    if (calculatedCadence >= MIN_CADENCE && 
-                        calculatedCadence <= MAX_CADENCE && 
-                        isValidCadenceChange(calculatedCadence, lastValidCadence)) {
-                        
-                        // Update buffer for moving average
-                        cadenceBuffer[bufferIndex] = calculatedCadence;
-                        bufferIndex = (bufferIndex + 1) % 5;
-                        
-                        // Calculate average cadence
-                        float sum = 0;
-                        for (int i = 0; i < 5; i++) {
-                            sum += cadenceBuffer[i];
-                        }
-                        float averageCadence = sum / 5;
-                        
-                        // Apply additional smoothing
-                        cadence = cadence * 0.7 + averageCadence * 0.3;
-                        
-                        // Update validation variables
-                        lastValidTime = currentTime;
-                        lastValidCadence = cadence;
-                        
-                        Serial.printf("New cadence: %.1f RPM (raw: %.1f)\n", 
-                                    cadence, calculatedCadence);
+                // More tolerant range check (5-130 RPM)
+                if (newCadence >= 5.0 && newCadence <= 130.0) {
+                    // If we had a previous valid cadence, use stronger smoothing
+                    if (cadence > 0) {
+                        // More weight to current cadence to prevent drops
+                        cadence = (cadence * 0.6) + (newCadence * 0.4);
+                    } else {
+                        // If starting from zero, trust the new reading more
+                        cadence = newCadence;
                     }
+                    lastValidTime = currentTime;
+                    lastValidCadence = cadence;
                 }
             }
             lastTriggerTime = currentTime;
         }
     }
     
-    wasTriggered = isMagnetTriggered;
-
-    // More gradual cadence reduction instead of immediate zero
-    if (currentTime - lastValidTime > ZERO_TIMEOUT) {
+    // Gradual decay instead of immediate zero
+    if ((currentTime - lastValidTime) > TIMEOUT) {
         if (cadence > 0) {
             // Gradually reduce cadence
-            cadence = max(0.0, cadence * 0.95);
-            if (cadence < 1.0) {
+            cadence = cadence * 0.95;  // Reduce by 5% each update
+            if (cadence < 5.0) {  // Only zero out if really slow
                 cadence = 0;
-                Serial.println("Cadence reset to 0 (timeout)");
             }
         }
     }
+    
+    lastMagnetState = currentMagnetState;
+}
 
-    // Update resistance and calculate power
-    resistance = getSmoothedResistance();
-    power = calculatePower(cadence, resistance);
+void updateResistance() {
+    // Read and smooth resistance value
+    const int numReadings = 5;
+    int total = 0;
+    
+    for (int i = 0; i < numReadings; i++) {
+        total += analogRead(RESISTANCE_PIN);
+        delay(1);
+    }
+    
+    int rawValue = total / numReadings;
+    
+    // Map to 0-100% range
+    resistance = map(rawValue, 1863, 2267, 0, 100);
+    resistance = constrain(resistance, 0, 100);
+}
 
-    // Calculate speed based on cadence
-    speed = cadence * 0.25;
+void updateMetrics() {
+    // Update cadence first
+    updateCadence();
+    
+    // Update resistance
+    updateResistance();
+    
+    // Calculate speed (simple conversion)
+    speed = cadence * 0.25;  // Example conversion factor
+    
+    // Calculate power based on cadence and resistance
+    float basePower = map(resistance, 0, 100, 5, 40);  // 5-40 base power range
+    power = (basePower * cadence) / 30.0;  // Simple power calculation
 }
 
 void sendBLEData() {
-    if (deviceConnected) {
-        uint8_t bikeData[8];
-        
-        uint16_t flags = 0x44;  // Speed and Power present
-        bikeData[0] = flags & 0xFF;
-        bikeData[1] = (flags >> 8) & 0xFF;
-        
-        uint16_t speedValue = speed * 100;  // 0.01 resolution
-        bikeData[2] = speedValue & 0xFF;
-        bikeData[3] = (speedValue >> 8) & 0xFF;
-        
-        uint16_t cadenceValue = cadence * 2;  // 0.5 resolution
-        bikeData[4] = cadenceValue & 0xFF;
-        bikeData[5] = (cadenceValue >> 8) & 0xFF;
-        
-        uint16_t powerValue = (uint16_t)power;
-        bikeData[6] = powerValue & 0xFF;
-        bikeData[7] = (powerValue >> 8) & 0xFF;
-        
-        pIndoorBikeDataCharacteristic->setValue(bikeData, 8);
-        pIndoorBikeDataCharacteristic->notify();
-    }
+    if (!deviceConnected) return;
+    
+    uint8_t data[8];
+    
+    // Flags
+    uint16_t flags = 0x44;  // Speed and power present
+    data[0] = flags & 0xFF;
+    data[1] = (flags >> 8) & 0xFF;
+    
+    // Speed (0.01 resolution)
+    uint16_t speedValue = speed * 100;
+    data[2] = speedValue & 0xFF;
+    data[3] = (speedValue >> 8) & 0xFF;
+    
+    // Cadence (0.5 resolution)
+    uint16_t cadenceValue = cadence * 2;
+    data[4] = cadenceValue & 0xFF;
+    data[5] = (cadenceValue >> 8) & 0xFF;
+    
+    // Power (watts)
+    uint16_t powerValue = (uint16_t)power;
+    data[6] = powerValue & 0xFF;
+    data[7] = (powerValue >> 8) & 0xFF;
+    
+    pBikeDataCharacteristic->setValue(data, 8);
+    pBikeDataCharacteristic->notify();
 }
 
 void setup() {
     Serial.begin(115200);
+    
+    // Configure pins
     pinMode(MAGNET_SENSOR_PIN, INPUT_PULLUP);
     pinMode(RESISTANCE_PIN, INPUT);
-
-    Serial.println("Starting LibrePulse Bike...");
-    Serial.printf("Magnet sensor pin: %d\n", MAGNET_SENSOR_PIN);
-    Serial.printf("Resistance pin: %d\n", RESISTANCE_PIN);
-
-    // Create the BLE Device
+    
+    // Initialize BLE
     BLEDevice::init(DEVICE_NAME);
+    
+    // Create server
     pServer = BLEDevice::createServer();
-    pServer->setCallbacks(new MyServerCallbacks());
-
-    // Create the BLE Service
-    BLEService *pService = pServer->createService(BLEUUID(FITNESSMACHINE_SERVICE_UUID));
-
-    // Create BLE Characteristics
-    pIndoorBikeDataCharacteristic = pService->createCharacteristic(
-        BLEUUID(INDOOR_BIKE_DATA_CHARACTERISTIC),
+    pServer->setCallbacks(new ServerCallbacks());
+    
+    // Create service (Fitness Machine Service)
+    BLEService *pService = pServer->createService(BLEUUID((uint16_t)0x1826));
+    
+    // Create characteristic (Indoor Bike Data)
+    pBikeDataCharacteristic = pService->createCharacteristic(
+        BLEUUID((uint16_t)0x2AD2),
         BLECharacteristic::PROPERTY_NOTIFY
     );
-    pIndoorBikeDataCharacteristic->addDescriptor(new BLE2902());
-
+    pBikeDataCharacteristic->addDescriptor(new BLE2902());
+    
+    // Start service and advertising
     pService->start();
-
-    // Start advertising
     BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-    pAdvertising->addServiceUUID(FITNESSMACHINE_SERVICE_UUID);
+    pAdvertising->addServiceUUID((uint16_t)0x1826);
     pAdvertising->setScanResponse(true);
-    pAdvertising->setMinPreferred(0x06);
     BLEDevice::startAdvertising();
-
-    Serial.println("BLE Indoor Bike Ready!");
+    
+    Serial.println("Bike Ready!");
 }
 
 void loop() {
+    // Update all measurements
     updateMetrics();
     
-    if (deviceConnected) {
-        sendBLEData();
-    }
+    // Send BLE update
+    sendBLEData();
     
-    Serial.printf("Power: %.1fW, Cadence: %.1frpm, Speed: %.1fkm/h, Resistance: %d%%\n",
-                  power, cadence, speed, resistance);
+    // Print debug info
+    Serial.printf("Cadence: %.1f RPM, Speed: %.1f km/h, Power: %.1f W, Resistance: %d%%\n",
+                  cadence, speed, power, resistance);
     
-    delay(100);  // 10Hz update rate
+    // Small delay to prevent overwhelming the serial output
+    delay(100);
 }
