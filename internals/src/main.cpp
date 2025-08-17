@@ -12,16 +12,12 @@ static const int MAGNET_SENSOR_PIN = 27;  // avoid strapping pins like GPIO12
 static const int RESISTANCE_PIN    = 34;  // ADC1 only
 
 /* ===================== Model Params ===================== */
-// Magnet is on the CRANK: cadence_rpm is CRANK RPM.
-// Speed will be derived using a gear ratio and wheel circumference.
+// Magnet on the CRANK: cadence_rpm is CRANK RPM.
+// Speed is derived from cadence * (effective gear ratio) * wheel circumference.
 static const uint8_t MAGNETS_PER_REV = 2;      // magnets per crank revolution
-static const float   POWER_BASE_MIN  = 5.0f;   // toy power model
-static const float   POWER_BASE_MAX  = 40.0f;
-
-static const float CADENCE_MIN = 5.0f;         // rpm sanity
-static const float CADENCE_MAX = 130.0f;
-
-static const uint32_t DEBOUNCE_US = 6000;      // reed/hall debounce
+static const float   CADENCE_MIN     = 5.0f;   // rpm sanity
+static const float   CADENCE_MAX     = 130.0f;
+static const uint32_t DEBOUNCE_US    = 6000;   // reed/hall debounce
 static const uint32_t NOTIFY_INTERVAL_MS = 100; // FTMS @10 Hz
 
 /* ===================== Calibration & Prefs ===================== */
@@ -36,8 +32,17 @@ struct Cal {
   float  gamma         = 1.0f;  // response shaping (1.0 = linear)
 
   // Motion model
-  int   wheel_circ_mm  = 2148;  // default 27.5" MTB ~2148 mm
+  int   wheel_circ_mm  = 2148;  // 27.5" MTB ~2148 mm
   float gear_ratio     = 2.2f;  // wheel revs per crank rev (typical mid-gear)
+
+  // Resistance-coupled speed factor (0..1). 0 = off (classic).
+  // ratio_eff = gear_ratio * (1 - speed_res_factor * r_norm)  [clamped ≥ 0.2]
+  float speed_res_factor = 0.0f;
+
+  // Torque model for power (Nm): T = Tmin + (Tmax - Tmin) * r_norm^1.0
+  // power_w = T * omega (omega = 2π * cadence/60)
+  float torque_min_nm = 0.5f;   // small baseline drag
+  float torque_max_nm = 25.0f;  // heavy-ish brake at 100%
 };
 
 Preferences prefs;
@@ -95,14 +100,17 @@ String readLine() {
 
 static void loadPrefs() {
   prefs.begin("bike", true);
-  cal.adc_free      = prefs.getInt("adc_free",   cal.adc_free);
-  cal.adc_engage    = prefs.getInt("adc_engage", cal.adc_engage);
-  cal.adc_high      = prefs.getInt("adc_high",   cal.adc_high);
-  cal.invert        = prefs.getBool("invert",    cal.invert);
-  cal.deadzone_pct  = prefs.getUChar("dz",       cal.deadzone_pct);
-  cal.gamma         = prefs.getFloat("gamma",    cal.gamma);
-  cal.wheel_circ_mm = prefs.getInt("circ_mm",    cal.wheel_circ_mm);
-  cal.gear_ratio    = prefs.getFloat("ratio",    cal.gear_ratio);
+  cal.adc_free         = prefs.getInt("adc_free",   cal.adc_free);
+  cal.adc_engage       = prefs.getInt("adc_engage", cal.adc_engage);
+  cal.adc_high         = prefs.getInt("adc_high",   cal.adc_high);
+  cal.invert           = prefs.getBool("invert",    cal.invert);
+  cal.deadzone_pct     = prefs.getUChar("dz",       cal.deadzone_pct);
+  cal.gamma            = prefs.getFloat("gamma",    cal.gamma);
+  cal.wheel_circ_mm    = prefs.getInt("circ_mm",    cal.wheel_circ_mm);
+  cal.gear_ratio       = prefs.getFloat("ratio",    cal.gear_ratio);
+  cal.speed_res_factor = prefs.getFloat("srf",      cal.speed_res_factor);
+  cal.torque_min_nm    = prefs.getFloat("tmin",     cal.torque_min_nm);
+  cal.torque_max_nm    = prefs.getFloat("tmax",     cal.torque_max_nm);
   prefs.end();
 }
 
@@ -116,14 +124,18 @@ static void savePrefs() {
   prefs.putFloat("gamma",    cal.gamma);
   prefs.putInt("circ_mm",    cal.wheel_circ_mm);
   prefs.putFloat("ratio",    cal.gear_ratio);
+  prefs.putFloat("srf",      cal.speed_res_factor);
+  prefs.putFloat("tmin",     cal.torque_min_nm);
+  prefs.putFloat("tmax",     cal.torque_max_nm);
   prefs.end();
 }
 
 static void printCalibration() {
-  Serial.printf("[CAL] free=%d, engage=%d, high=%d | invert=%s | deadzone=%u%% | gamma=%.2f | wheel=%d mm | ratio=%.2f\n",
+  Serial.printf("[CAL] free=%d, engage=%d, high=%d | invert=%s | deadzone=%u%% | gamma=%.2f\n",
       cal.adc_free, cal.adc_engage, cal.adc_high,
-      cal.invert ? "true":"false", cal.deadzone_pct, cal.gamma,
-      cal.wheel_circ_mm, cal.gear_ratio);
+      cal.invert ? "true":"false", cal.deadzone_pct, cal.gamma);
+  Serial.printf("[CFG] wheel=%d mm | ratio=%.2f | speed_res_factor=%.2f | torque_min=%.2f Nm | torque_max=%.2f Nm\n",
+      cal.wheel_circ_mm, cal.gear_ratio, cal.speed_res_factor, cal.torque_min_nm, cal.torque_max_nm);
 }
 
 /* Map raw ADC -> 0..100% (anchor 0% at ENGAGE, 100% at HIGH; auto-invert; gamma) */
@@ -151,7 +163,7 @@ static float mapCalibrated(int raw) {
   return pct;
 }
 
-/* ===================== Cadence / Resistance / Speed ===================== */
+/* ===================== Cadence / Resistance / Speed / Power ===================== */
 void updateCadence() {
   static uint32_t lastSeenPulseUs = 0;
   uint32_t nowMs = millis();
@@ -164,7 +176,7 @@ void updateCadence() {
   if (intervalUs > 0 && pulseUs != 0 && pulseUs != lastSeenPulseUs) {
     lastSeenPulseUs = pulseUs;
 
-    // NOTE: Magnet is on the CRANK ⇒ MAGNETS_PER_REV pulses per crank revolution.
+    // CRANK RPM (magnet on crank; MAGNETS_PER_REV pulses per crank rev)
     float crankRevPerSec = 1e6f / (float(intervalUs) * MAGNETS_PER_REV);
     float rpm = crankRevPerSec * 60.0f;
 
@@ -198,19 +210,33 @@ void updateResistance() {
 }
 
 static inline float speedPerCadence_kmh() {
-  // km/h per CRANK RPM = gear_ratio * (wheel_circ_mm * 60 / 1e6)
-  return cal.gear_ratio * (cal.wheel_circ_mm * 60.0f / 1e6f);
+  // ratio_eff = base_ratio * (1 - srf * r_norm), clamped to ≥ 0.2
+  float r_norm = resistance_pct / 100.0f;
+  float ratio_eff = cal.gear_ratio * (1.0f - cal.speed_res_factor * r_norm);
+  if (ratio_eff < 0.2f) ratio_eff = 0.2f;
+
+  // km/h per CRANK RPM = ratio_eff * (wheel_circ_mm * 60 / 1e6)
+  return ratio_eff * (cal.wheel_circ_mm * 60.0f / 1e6f);
+}
+
+static inline float torqueFromResistance_Nm() {
+  // Linear in r_norm (you can switch to exponential if you like):
+  float r_norm = resistance_pct / 100.0f;
+  float T = cal.torque_min_nm + (cal.torque_max_nm - cal.torque_min_nm) * r_norm;
+  if (T < 0.0f) T = 0.0f;
+  return T;
 }
 
 void updateMetrics() {
   updateCadence();
   updateResistance();
 
-  speed_kmh = cadence_rpm * speedPerCadence_kmh(); // CADENCE = crank rpm (as requested)
+  speed_kmh = cadence_rpm * speedPerCadence_kmh();
 
-  // Simple toy power model using cadence + resistance
-  float base = POWER_BASE_MIN + (POWER_BASE_MAX - POWER_BASE_MIN) * (resistance_pct / 100.0f);
-  power_w = (base * cadence_rpm) / 30.0f;
+  // Torque-based power: P = T * omega (omega = 2π * cadence / 60)
+  const float omega = (2.0f * (float)M_PI) * (cadence_rpm / 60.0f);
+  const float T = torqueFromResistance_Nm();
+  power_w = T * omega;
 }
 
 /* ===================== BLE: FTMS Indoor Bike Data ===================== */
@@ -307,8 +333,10 @@ void printHelp() {
   Serial.println("  show                - print current calibration/params");
   Serial.println("  raw                 - stream raw ADC -> % (Ctrl+C to stop monitor)");
   Serial.println("  setcirc <mm>        - set wheel circumference in mm (1500..3000), e.g. setcirc 2148");
-  Serial.println("  setratio <x>        - set gear ratio (wheel revs per crank rev), e.g. setratio 2.2");
-  Serial.println("  setgamma <x>        - set gamma shaping (0.5..2.0)");
+  Serial.println("  setratio <x>        - set base gear ratio (wheel revs per crank rev), e.g. setratio 2.2");
+  Serial.println("  setspeedres <f>     - set resistance→ratio factor 0..1 (0=off). e.g. setspeedres 0.3");
+  Serial.println("  settorque <min> <max> - set torque model in Nm, e.g. settorque 0.5 25");
+  Serial.println("  setgamma <x>        - set resistance gamma shaping (0.5..2.0)");
   Serial.println("  help                - show this help");
 }
 
@@ -350,12 +378,48 @@ void handleCommand(const String& cmdLine) {
       float r = cmdLine.substring(sp+1).toFloat();
       if (r > 0.3f && r < 5.0f) {
         cal.gear_ratio = r; savePrefs();
-        Serial.printf("Gear ratio set to %.2f (wheel revs per crank rev)\n", cal.gear_ratio);
+        Serial.printf("Base gear ratio set to %.2f (wheel revs per crank rev)\n", cal.gear_ratio);
       } else {
         Serial.println("Enter a sensible ratio (0.3..5.0). Typical MTB mid-gear ~2.2");
       }
     } else {
-      Serial.printf("Current ratio: %.2f\nUsage: setratio 2.2\n", cal.gear_ratio);
+      Serial.printf("Current base ratio: %.2f\nUsage: setratio 2.2\n", cal.gear_ratio);
+    }
+    return;
+  }
+  if (cmdLine.startsWith("setspeedres")) {
+    int sp = cmdLine.indexOf(' ');
+    if (sp > 0) {
+      float f = cmdLine.substring(sp+1).toFloat();
+      if (f < 0.0f) f = 0.0f; if (f > 1.0f) f = 1.0f;
+      cal.speed_res_factor = f; savePrefs();
+      Serial.printf("Resistance→ratio factor set to %.2f (0=off). ratio_eff = ratio*(1 - %.2f*r)\n",
+                    cal.speed_res_factor, cal.speed_res_factor);
+    } else {
+      Serial.printf("Current speed_res_factor: %.2f\nUsage: setspeedres 0.3\n", cal.speed_res_factor);
+    }
+    return;
+  }
+  if (cmdLine.startsWith("settorque")) {
+    // settorque <min> <max>
+    int sp = cmdLine.indexOf(' ');
+    if (sp > 0) {
+      int sp2 = cmdLine.indexOf(' ', sp+1);
+      if (sp2 > 0) {
+        float tmin = cmdLine.substring(sp+1, sp2).toFloat();
+        float tmax = cmdLine.substring(sp2+1).toFloat();
+        if (tmin < 0.0f) tmin = 0.0f;
+        if (tmax < tmin + 0.5f) tmax = tmin + 0.5f;
+        cal.torque_min_nm = tmin;
+        cal.torque_max_nm = tmax;
+        savePrefs();
+        Serial.printf("Torque model set: Tmin=%.2f Nm, Tmax=%.2f Nm\n", cal.torque_min_nm, cal.torque_max_nm);
+      } else {
+        Serial.println("Usage: settorque 0.5 25");
+      }
+    } else {
+      Serial.printf("Current torque: Tmin=%.2f Nm, Tmax=%.2f Nm\n", cal.torque_min_nm, cal.torque_max_nm);
+      Serial.println("Usage: settorque 0.5 25");
     }
     return;
   }
@@ -431,7 +495,11 @@ void loop() {
   if (now - lastPrint >= 500) {
     lastPrint = now;
     int raw = analogRead(RESISTANCE_PIN);
-    Serial.printf("Cad: %.1f RPM | Spd: %.2f km/h | Pwr: %.1f W | Res: %d%% | raw=%d\n",
-                  cadence_rpm, speed_kmh, power_w, resistance_pct, raw);
+    // Show ratio_eff for visibility
+    float r_norm = resistance_pct / 100.0f;
+    float ratio_eff = cal.gear_ratio * (1.0f - cal.speed_res_factor * r_norm);
+    if (ratio_eff < 0.2f) ratio_eff = 0.2f;
+    Serial.printf("Cad: %.1f RPM | Spd: %.2f km/h | Pwr: %.1f W | Res: %d%% | raw=%d | ratio_eff=%.2f\n",
+                  cadence_rpm, speed_kmh, power_w, resistance_pct, raw, ratio_eff);
   }
 }
